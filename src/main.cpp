@@ -99,6 +99,8 @@ void CoreInstance::lineFromCore(string &line, class Graphserv &app)
         if(app.findClient(lastClientID))
             flog(LOG_ERROR, _("CoreInstance '%s', ID %u: lineFromCore(): not expecting anything from this core\n"), getName().c_str(), getID());
     }
+    // write any pending commands to core process. 
+    flushCommandQ(app);
 }
 
 // write out as many commands from queue to core process as possible.
@@ -395,24 +397,87 @@ class ccSessionInfo: public ServCmd_RTOther
 {
     public:
         string getName() { return "session-info"; }
-        string getSynopsis() { return getName(); }
-        string getHelpText() { return _("returns information on your current session."); }
+        string getSynopsis() { return getName() + " [GRAPH]"; }
+        string getHelpText() { return _("returns information on your current session, or the session connected to GRAPH."); }
         AccessLevel getAccessLevel() { return ACCESS_READ; }
 
         CommandStatus execute(vector<string> words, class Graphserv &app, class SessionContext &sc)
         {
-            if(words.size()!=1)
+            if(words.size()>2)
             {
                 syntaxError();
                 sc.forwardStatusline(lastStatusMessage);
                 return CMD_FAILURE;
             }
+            SessionContext *sci= &sc;
+            if(words.size()==2)
+            {
+                CoreInstance *ci= app.findNamedInstance(words[1]);
+                if(!ci)
+                {
+                    cliFailure(_("no such core '%s'\n"), words[1].c_str());
+                    sc.forwardStatusline(lastStatusMessage);
+                    return CMD_FAILURE;
+                }
+                if(!(sci= app.findClientByCoreID(ci->getID())))
+                {
+                    cliFailure(_("core '%s' not connected to a client\n"), words[1].c_str());
+                    sc.forwardStatusline(lastStatusMessage);
+                    return CMD_FAILURE;
+                }
+            }
             cliSuccess(_("session info:\n"));
             sc.forwardStatusline(lastStatusMessage);
-            CoreInstance *ci= app.findInstance(sc.coreID);
+            CoreInstance *ci= app.findInstance(sci->coreID);
             // prints minimal info. might print some session statistics (avg lines queued, etc).
             sc.forwardDataset(format("ConnectedGraph,%s\n", ci? ci->getName().c_str(): "None").c_str());
-            sc.forwardDataset(format("AccessLevel,%s\n", gAccessLevelNames[sc.accessLevel]).c_str());
+            sc.forwardDataset(format("AccessLevel,%s\n", gAccessLevelNames[sci->accessLevel]).c_str());
+            sc.forwardDataset(format("dbg_linebuf_size,%d\n", sci->linebuf.size()));
+            sc.forwardDataset(format("dbg_linequeue_size,%d\n", sci->lineQueue.size()));
+            sc.forwardDataset(format("dbg_invalidDatasetStatus,%d\n", sci->invalidDatasetStatus));
+            sc.forwardDataset(format("dbg_shutdownTime,%.0f\n", sci->shutdownTime));
+            sc.forwardDataset("\n");
+            return CMD_SUCCESS;
+        }
+
+};
+
+class ccCoreInfo: public ServCmd_RTOther
+{
+    public:
+        string getName() { return "core-info"; }
+        string getSynopsis() { return getName() + " GRAPH"; }
+        string getHelpText() { return _("print debug information about GRAPH."); }
+        AccessLevel getAccessLevel() { return ACCESS_READ; }
+
+        CommandStatus execute(vector<string> words, class Graphserv &app, class SessionContext &sc)
+        {
+            if(words.size()!=2)
+            {
+                syntaxError();
+                sc.forwardStatusline(lastStatusMessage);
+                return CMD_FAILURE;
+            }
+            CoreInstance *ci= app.findNamedInstance(words[1]);
+            if(!ci)
+            {
+                cliFailure(_("no such core '%s'\n"), words[1].c_str());
+                sc.forwardStatusline(lastStatusMessage);
+                return CMD_FAILURE;
+            }
+            cliSuccess(_("core info:\n"));
+            sc.forwardStatusline(lastStatusMessage);
+            //~ sc.forwardDataset(format("ConnectedGraph,%s\n", ci? ci->getName().c_str(): "None").c_str());
+            //~ sc.forwardDataset(format("AccessLevel,%s\n", gAccessLevelNames[sci->accessLevel]).c_str());
+            //~ sc.forwardDataset(format("dbg_linebuf_size,%d\n", sci->linebuf.size()));
+            //~ sc.forwardDataset(format("dbg_linequeue_size,%d\n", sci->lineQueue.size()));
+            //~ sc.forwardDataset(format("dbg_invalidDatasetStatus,%d\n", sci->invalidDatasetStatus));
+            //~ sc.forwardDataset(format("dbg_shutdownTime,%.0f\n", sci->shutdownTime));
+            sc.forwardDataset(format("instanceID,%d\n", ci->instanceID));
+            sc.forwardDataset(format("commandQ.size__,%d\n", ci->commandQ.size()));
+            sc.forwardDataset(format("commandQ.front__.flushable__,%s\n", ci->commandQ.front().flushable()? "true": "false"));
+            sc.forwardDataset(format("expectingReply,%s\n", ci->expectingReply? "true": "false"));
+            sc.forwardDataset(format("expectingDataset,%s\n", ci->expectingDataset? "true": "false"));
             sc.forwardDataset("\n");
             return CMD_SUCCESS;
         }
@@ -677,42 +742,6 @@ class ccHelp: public ServCmd_RTOther
 
 };
 
-#if 0
-// server-info command
-class ccServerInfo: public ServCmd_RTOther
-{
-    public:
-        string getName() { return "server-info"; }
-        string getSynopsis() { return getName(); }
-        string getHelpText() { return _("get information on the server."); }
-        AccessLevel getAccessLevel() { return ACCESS_READ; }
-
-        ccServerInfo()
-        { }
-
-        CommandStatus execute(vector<string> words, Graphserv &app, SessionContext &sc)
-        {
-            if(words.size()!=1)
-            {
-                syntaxError();
-                sc.forwardStatusline(lastStatusMessage);
-                return CMD_FAILURE;
-            }
-
-            cliSuccess(":\n");
-            sc.forwardStatusline(lastStatusMessage);
-
-            sc.forwardDataset("ProtocolVersion," stringify(PROTOCOL_VERSION));
-
-
-            sc.forwardDataset("\n");
-
-            return CMD_SUCCESS;
-        }
-
-};
-#endif
-
 
 // shutdown command is filtered by the server.
 class ccShutdown: public ServCmd_RTVoid
@@ -752,8 +781,8 @@ class ccShutdown: public ServCmd_RTVoid
 
             return CMD_SUCCESS;
         }
-
 };
+
 
 
 
@@ -764,6 +793,7 @@ ServCli::ServCli(Graphserv &_app): app(_app)
     addCommand(new ccUseGraph());
 #ifdef DEBUG_COMMANDS
     addCommand(new ccInfo());
+    addCommand(new ccCoreInfo());
 #endif
     addCommand(new ccAuthorize());
     addCommand(new ccHelp(*this));
@@ -774,7 +804,6 @@ ServCli::ServCli(Graphserv &_app): app(_app)
     addCommand(new ccProtocolVersion());
     addCommand(new ccQuit());
     addCommand(new ccShutdown());
-//    addCommand(new ccServerInfo());
 }
 
 

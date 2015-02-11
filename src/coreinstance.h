@@ -57,7 +57,6 @@ struct CommandQEntry
 class LineRecvQ
 {
 	public:
-		// todo: figure out how to use move semantics
 		deque<string> nextLines(const string& str)
 		{
 			deque<string> lineQueue;
@@ -325,7 +324,7 @@ class CoreInstance: public NonblockWriter
         }
         
         event *readEvent, *stderrReadEvent, *writeEvent;
-
+        
     private:
         uint32_t instanceID;
         string lastError;
@@ -350,6 +349,7 @@ class CoreInstance: public NonblockWriter
 
         friend class ccInfo;
         friend class ccShutdown;
+        friend class ccCoreInfo;
 };
 
 

@@ -82,461 +82,6 @@ class Graphserv
                 return mainloop_select();
         }
         
-        // called when a session socket is readable (level triggered)
-        template<ConnectionType CONNTYPE>
-        void cb_sessionReadable(evutil_socket_t fd, short what)
-        {
-            const size_t BUFSIZE= 128;
-            char buf[BUFSIZE];
-            SessionContext &sc= *libeventData.sessions[fd];
-            double time= getTime();
-            ssize_t sz= recv(fd, buf, sizeof(buf), 0);
-            auto closeSession= [this] (SessionContext& sc)
-            {
-                removeSession(sc.clientID);
-            };
-            if(sz==0)
-            {
-                flog(LOG_INFO, _("client %d: connection closed%s.\n"), sc.clientID, sc.shutdownTime? "": _(" by peer"));
-                closeSession(sc);
-            }
-            else if(sz<0)
-            {
-                flog(LOG_ERROR, _("recv() error, client %d, %d bytes in write buffer, %s\n"), sc.clientID, sc.getWritebufferSize(), strerror(errno));
-                closeSession(sc);
-            }
-            else
-            {
-                for(ssize_t i= 0; i<sz; i++)
-                {
-                    char c= buf[i];
-                    if(c=='\r') continue;   // someone is feeding us DOS newlines?
-                    sc.linebuf+= c;
-                    if(c=='\n')
-                    {
-                        //~ flog(LOG_INFO, "line from client: %s", sc.linebuf.c_str());
-
-                        linesFromClients++;
-
-                        if(CONNTYPE==CONN_HTTP)
-                            lineFromHTTPClient(sc.linebuf, *(HTTPSessionContext*)&sc, time);
-                        else
-                            lineFromClient(string(sc.linebuf), sc, time);
-                        sc.linebuf.clear();
-                    }
-                }
-            }
-        }
-
-        // called when a session socket is writable (edge triggered)
-        template<ConnectionType CONNTYPE>
-        void cb_sessionWritable(evutil_socket_t fd, short what)
-        {
-            flog(LOG_INFO, "session context writable event\n");
-            libeventData.sessions[fd]->flush();
-        }
-        
-        // called when a core pipe is readable (level triggered)
-        
-        // XXXXXXXXXX todo: handle different CB types (all callbacks)
-        void cb_coreReadable(evutil_socket_t fd, short what)
-        {
-            CoreInstance *ci= libeventData.cores[fd];
-            if(fd==ci->getReadFd())
-            {
-                const size_t BUFSIZE= 128;
-                char buf[BUFSIZE];
-                ssize_t sz= read(ci->getReadFd(), buf, sizeof(buf));
-                double time= getTime();
-                if(sz==0)
-                {
-                    flog(LOG_INFO, "core %s (ID %u, pid %d) has exited\n", ci->getName().c_str(), ci->getID(), (int)ci->getPid());
-                    int status;
-                    waitpid(ci->getPid(), &status, 0);  // un-zombify
-                    //~ coresToRemove.push_back(ci);
-                    removeCoreInstance(ci);
-                }
-                else if(sz<0)
-                {
-                    flog(LOG_ERROR, "i/o error, core %s: %s\n", ci->getName().c_str(), strerror(errno));
-                    //~ coresToRemove.push_back(ci);
-                    removeCoreInstance(ci);
-                }
-                else
-                {
-                    for(ssize_t i= 0; i<sz; i++)
-                    {
-                        char c= buf[i];
-                        if(c=='\r') continue;
-                        ci->linebuf+= c;
-                        if(c=='\n')
-                        {
-                            SessionContext *sc= findClient(ci->getLastClientID());
-                            bool clientWasWaiting= (sc && sc->isWaitingForCoreReply());
-                            ci->lineFromCore(ci->linebuf, *this);
-                            ci->linebuf.clear();
-                            // if this was the last line the client was waiting for, 
-                            // execute its queued commands now.
-                            if( clientWasWaiting )
-                                while(!sc->lineQueue.empty() && (!sc->isWaitingForCoreReply()))
-                                {
-                                    string& line= sc->lineQueue.front();
-                                    flog(LOG_INFO, "execing queued line from client: '%s", line.c_str());
-                                    lineFromClient(line, *sc, time, true);
-                                    sc->lineQueue.pop();
-                                }
-                        }
-                    }
-                }
-            }
-            else if(fd==ci->getStderrReadFd())
-            {
-                deque<string> lines= ci->stderrQ.nextLines(ci->getStderrReadFd());
-                for(deque<string>::const_iterator it= lines.begin(); it!=lines.end(); ++it)
-                    flog(LOG_INFO, "[%s] %s", ci->getName().c_str(), it->c_str());
-            }
-        }
-
-        // called when a core pipe is writable (edge triggered)
-        void cb_coreWritable(evutil_socket_t fd, short what)
-        {
-            flog(LOG_INFO, "core writable event\n");
-            libeventData.cores[fd]->flush();
-        }
-
-        // called when something connects to either of the listen sockets
-        template<ConnectionType CONNTYPE>
-        void cb_connect(evutil_socket_t fd, short what)
-        {
-            flog(LOG_INFO, "cb_connect(): fd=%d, what=%d\n", fd, what);
-            SessionContext *sc= acceptConnection(fd, CONNTYPE);
-            if(sc)
-            {
-                sc->sockfdRead= dup(sc->sockfd);
-                libeventData.sessions[sc->sockfd]= sc;
-                libeventData.sessions[sc->sockfdRead]= sc;
-                sc->readEvent= event_new(libeventData.base, sc->sockfdRead, EV_READ|EV_PERSIST, [](evutil_socket_t fd, short what, void *arg)
-                    {
-                        ((Graphserv*)arg)->cb_sessionReadable<CONNTYPE>(fd, what);
-                    }, this);
-                sc->writeEvent= event_new(libeventData.base, sc->sockfd, EV_WRITE|EV_PERSIST|EV_ET, [](evutil_socket_t fd, short what, void *arg)
-                    {
-                        ((Graphserv*)arg)->cb_sessionWritable<CONNTYPE>(fd, what);
-                    }, this);
-                event_add(sc->readEvent, nullptr);
-                event_add(sc->writeEvent, nullptr);
-            }
-            else
-            {
-                flog(LOG_ERROR, _("couldn't create connection.\n"));
-                //~ if(errno==EMFILE)
-                //~ {
-                    //~ double defer= 3.0;
-                    //~ flog(LOG_ERROR, _("too many open files. deferring new connections for %.0f seconds.\n"), defer);
-                    //~ deferNewConnectionsUntil= time + defer;
-                //~ }
-            }
-        }
-        
-        bool mainloop_libevent()
-        {
-#ifdef DEBUG_EVENTS
-            event_enable_debug_mode();
-#endif
-
-            flog(LOG_INFO, "compiled libevent version: %s\n", LIBEVENT_VERSION);
-            flog(LOG_INFO, "runtime libevent version: %s\n", event_get_version());
-            
-            event_config *cfg= event_config_new();
-            if(!cfg)
-                throw std::runtime_error("event_config_new() failed");
-            event_config_require_features(cfg, EV_FEATURE_ET); //|EV_FEATURE_FDS); // 
-            if(!(libeventData.base= event_base_new_with_config(cfg)))
-                throw std::runtime_error("event_base_new_with_config() failed");
-            event_config_free(cfg);
-            
-            int i;
-            const char **methods = event_get_supported_methods();
-            flog(LOG_INFO, "Starting Libevent %s.  Available methods are:\n", event_get_version());
-            for (i=0; methods[i] != NULL; ++i)
-                flog(LOG_INFO, "    %s\n", methods[i]);
-            flog(LOG_INFO, "Using Libevent with backend method %s.\n", event_base_get_method(libeventData.base));
-            int f = event_base_get_features(libeventData.base);
-            if ((f & EV_FEATURE_ET))
-                flog(LOG_INFO, "  Edge-triggered events are supported.\n");
-            if ((f & EV_FEATURE_O1))
-                flog(LOG_INFO, "  O(1) event notification is supported.\n");
-            if ((f & EV_FEATURE_FDS))
-                flog(LOG_INFO, "  All FD types are supported.\n");
-            
-            event_callback_fn listen_cb= [] (evutil_socket_t fd, short what, void *arg)
-            {
-                Graphserv *self= (Graphserv*)arg;
-                self->cb_connect<CONN_TCP>(fd, what);
-            };
-            event_callback_fn http_cb= [] (evutil_socket_t fd, short what, void *arg)
-            {
-                Graphserv *self= (Graphserv*)arg;
-                self->cb_connect<CONN_HTTP>(fd, what);
-            };
-            event *ev= event_new(libeventData.base, listenSocket, EV_READ|EV_PERSIST, listen_cb, this);
-            event_add(ev, nullptr);
-            ev= event_new(libeventData.base, httpSocket, EV_READ|EV_PERSIST, http_cb, this);
-            event_add(ev, nullptr);
-            
-            while(true)
-            {
-                event_base_loop(libeventData.base, EVLOOP_ONCE);
-            }
-            
-            throw std::runtime_error("mainloop_libevent: not implemented");
-        }
-
-        bool mainloop_select()
-        {
-            fd_set readfds, writefds;
-            int maxfd;
-            double deferNewConnectionsUntil= 0; // defer accept() calls. set if open files limit is hit.
-
-            flog(LOG_INFO, "entering main loop. TCP port: %d, HTTP port: %d\n", tcpPort, httpPort);
-            while(!quit)
-            {
-                double time= getTime();
-
-                FD_ZERO(&readfds);
-                FD_ZERO(&writefds);
-
-                maxfd= 0;
-
-                // when open files limit is hit, new connections will be deferred for a few seconds
-                if(deferNewConnectionsUntil < time)
-                {
-                    if(listenSocket) fd_add(readfds, listenSocket, maxfd);
-                    if(httpSocket) fd_add(readfds, httpSocket, maxfd);
-                }
-
-                // deferred removal of clients
-                for(set<uint32_t>::iterator i= clientsToRemove.begin(); i!=clientsToRemove.end(); ++i)
-                    removeSession(*i);
-                clientsToRemove.clear();
-
-                // init fd set for select: add client fds
-                for( map<uint32_t,SessionContext*>::iterator i= sessionContexts.begin(); i!=sessionContexts.end(); ++i )
-                {
-                    SessionContext *sc= i->second;
-                    double d= time-sc->stats.lastTime;
-                    if(d>10.0)
-                    {
-                        sc->stats.normalize(time);
-                        // flog(LOG_INFO, "client %u: bytesSent %.2f, linesQueued %.2f, coreCommandsSent %.2f, servCommandsSent %.2f\n",
-                        //      sc->clientID, sc->stats.bytesSent, sc->stats.linesQueued, sc->stats.coreCommandsSent, sc->stats.servCommandsSent);
-                        // testing this to prevent flooding.
-                        //~ if(sc->stats.linesQueued>5000) { flog(LOG_INFO, "choke\n"); sc->chokeTime= time+10.0; }
-                        sc->stats.reset();
-                        sc->stats.lastTime= time;
-                    }
-                    if(sc->chokeTime<time)  // chokeTime could be used to slow down a spamming client.
-                        fd_add(readfds, sc->sockfd, maxfd);
-                    else
-                        flog(LOG_INFO, "not reading from client %u (flood).\n", sc->clientID);
-                    // only add write fd if there is something to write
-                    if(!sc->writeBufferEmpty())
-                        fd_add(writefds, sc->sockfd, maxfd);
-                }
-
-                // init fd set for select: add core fds
-                for( map<uint32_t,CoreInstance*>::iterator i= coreInstances.begin(); i!=coreInstances.end(); ++i )
-                {
-                    CoreInstance *ci= i->second;
-                    fd_add(readfds, ci->getReadFd(), maxfd);
-                    fd_add(readfds, ci->getStderrReadFd(), maxfd);
-                    ci->flushCommandQ(*this);
-                    // only add write fd if there is something to write
-                    if(!ci->writeBufferEmpty())
-                        fd_add(writefds, ci->getWriteFd(), maxfd);
-                }
-
-                struct timeval timeout;
-                timeout.tv_sec= 2;
-                timeout.tv_usec= 0;
-                int r= select(maxfd+1, &readfds, &writefds, 0, &timeout);
-                if(r<0)
-                {
-                    switch(errno)
-                    {
-                        case EBADF:
-                            logerror("select()");
-                            // a file descriptor is bad, find out which and remove the client or core.
-                            for( map<uint32_t,SessionContext*>::iterator i= sessionContexts.begin(); i!=sessionContexts.end(); ++i )
-                                if( !i->second->writeBufferEmpty() && fcntl(i->second->sockfd, F_GETFL)==-1 )
-                                    flog(LOG_ERROR, _("bad fd, removing client %d.\n"), i->second->clientID),
-                                    forceClientDisconnect(i->second);
-                            for( map<uint32_t,CoreInstance*>::iterator i= coreInstances.begin(); i!=coreInstances.end(); ++i )
-                                if( fcntl(i->second->getReadFd(), F_GETFL)==-1 ||
-                                    (!i->second->writeBufferEmpty() && fcntl(i->second->getWriteFd(), F_GETFL)==-1) )
-                                    flog(LOG_ERROR, _("bad fd, removing core %d.\n"), i->second->getID()),
-                                    removeCoreInstance(i->second);
-                            continue;
-                        
-                        case EINTR:
-                            continue;
-
-                        default:
-                            logerror("select()");
-                            return false;
-                    }
-                }
-
-                time= getTime();
-
-                // check for incoming line-based or http connections.
-                struct { int socket; ConnectionType conntype; } socks[]= { { listenSocket, CONN_TCP }, { httpSocket, CONN_HTTP } };
-                for(auto& i: socks)
-                {
-                    if(i.socket && FD_ISSET(i.socket, &readfds))
-                        if(!acceptConnection(i.socket, i.conntype))
-                        {
-                            flog(LOG_ERROR, _("couldn't create connection.\n"));
-                            if(errno==EMFILE)
-                            {
-                                double defer= 3.0;
-                                flog(LOG_ERROR, _("too many open files. deferring new connections for %.0f seconds.\n"), defer);
-                                deferNewConnectionsUntil= time + defer;
-                            }
-                        }
-                }
-
-                // loop through all the session contexts, handle incoming data, flush outgoing data if possible.
-                for( map<uint32_t,SessionContext*>::iterator it= sessionContexts.begin(); it!=sessionContexts.end(); ++it )
-                {
-                    SessionContext &sc= *it->second;
-                    int sockfd= sc.sockfd;
-                    if(FD_ISSET(sockfd, &readfds))
-                    {
-                        const size_t BUFSIZE= 128;
-                        char buf[BUFSIZE];
-                        ssize_t sz= recv(sockfd, buf, sizeof(buf), 0);
-                        if(sz==0)
-                        {
-                            flog(LOG_INFO, _("client %d: connection closed%s.\n"), sc.clientID, sc.shutdownTime? "": _(" by peer"));
-                            clientsToRemove.insert(sc.clientID);
-                        }
-                        else if(sz<0)
-                        {
-                            flog(LOG_ERROR, _("recv() error, client %d, %d bytes in write buffer, %s\n"), sc.clientID, sc.getWritebufferSize(), strerror(errno));
-                            clientsToRemove.insert(sc.clientID);
-                        }
-                        else
-                        {
-                            for(ssize_t i= 0; i<sz; i++)
-                            {
-                                char c= buf[i];
-                                if(c=='\r') continue;   // someone is feeding us DOS newlines?
-                                sc.linebuf+= c;
-                                if(c=='\n')
-                                {
-                                    if(clientsToRemove.find(sc.clientID)!=clientsToRemove.end())
-                                        break;
-
-                                    linesFromClients++;
-
-									if(sc.connectionType==CONN_HTTP)
-                                        lineFromHTTPClient(sc.linebuf, *(HTTPSessionContext*)&sc, time);
-                                    else
-                                        lineFromClient(string(sc.linebuf), sc, time);
-                                    sc.linebuf.clear();
-                                }
-                            }
-                        }
-                    }
-                    if(FD_ISSET(sockfd, &writefds))
-                        sc.flush();
-                }
-
-                vector<CoreInstance*> coresToRemove;
-
-                // loop through all the core instances, handle incoming data, flush outgoing data if possible.
-                for( map<uint32_t,CoreInstance*>::iterator i= coreInstances.begin(); i!=coreInstances.end(); ++i )
-                {
-                    CoreInstance *ci= i->second;
-                    if(FD_ISSET(ci->getReadFd(), &readfds))
-                    {
-                        const size_t BUFSIZE= 1024;
-                        char buf[BUFSIZE];
-                        ssize_t sz= read(ci->getReadFd(), buf, sizeof(buf));
-                        if(sz==0)
-                        {
-                            flog(LOG_INFO, "core %s (ID %u, pid %d) has exited\n", ci->getName().c_str(), ci->getID(), (int)ci->getPid());
-                            int status;
-                            waitpid(ci->getPid(), &status, 0);  // un-zombify
-                            coresToRemove.push_back(ci);
-                        }
-                        else if(sz<0)
-                        {
-                            flog(LOG_ERROR, "i/o error, core %s: %s\n", ci->getName().c_str(), strerror(errno));
-                            coresToRemove.push_back(ci);
-                        }
-                        else
-                        {
-                            for(ssize_t i= 0; i<sz; i++)
-                            {
-                                char c= buf[i];
-                                if(c=='\r') continue;
-                                ci->linebuf+= c;
-                                if(c=='\n')
-                                {
-                                    SessionContext *sc= findClient(ci->getLastClientID());
-                                    bool clientWasWaiting= (sc && sc->isWaitingForCoreReply());
-                                    ci->lineFromCore(ci->linebuf, *this);
-                                    ci->linebuf.clear();
-                                    // if this was the last line the client was waiting for, 
-                                    // execute its queued commands now.
-                                    if( clientWasWaiting )
-                                        while(!sc->lineQueue.empty() && (!sc->isWaitingForCoreReply()))
-                                        {
-                                            string& line= sc->lineQueue.front();
-                                            flog(LOG_INFO, "execing queued line from client: '%s", line.c_str());
-                                            lineFromClient(line, *sc, time, true);
-                                            sc->lineQueue.pop();
-                                        }
-                                }
-                            }
-                        }
-                    }
-                    else if(FD_ISSET(ci->getStderrReadFd(), &readfds))
-                    {
-                        deque<string> lines= ci->stderrQ.nextLines(ci->getStderrReadFd());
-						for(deque<string>::const_iterator it= lines.begin(); it!=lines.end(); ++it)
-							flog(LOG_INFO, "[%s] %s", ci->getName().c_str(), it->c_str());
-					}
-                    
-					if(FD_ISSET(ci->getWriteFd(), &writefds))
-                        ci->flush();
-                }
-                // remove outside of loop to avoid invalidating iterators
-                for(size_t i= 0; i<coresToRemove.size(); i++)
-                    removeCoreInstance(coresToRemove[i]);
-
-                // go through any HTTP session contexts immediately after i/o.
-                for( map<uint32_t,SessionContext*>::iterator i= sessionContexts.begin(); i!=sessionContexts.end(); ++i )
-                {
-                    SessionContext *sc= i->second;
-                    CoreInstance *ci;
-                    // HTTP clients are disconnected once we don't have any more output for them.
-                    if( sc->connectionType==CONN_HTTP &&
-                        ((HTTPSessionContext*)sc)->conversationFinished &&
-                        sc->writeBufferEmpty() &&
-                        ((ci= findInstance(sc->coreID))==NULL || ci->hasDataForClient(sc->clientID)==false) )
-                    {
-                        if(!sc->shutdownTime)
-                            shutdownClient(sc);
-                    }
-                }
-            }
-
-            return true;
-        }
-
         // check for valid graph name.
         // [a-zA-Z_-][a-zA-Z0-9_-]*
         bool isValidGraphName(const string& name)
@@ -631,6 +176,15 @@ class Graphserv
             if(it!=sessionContexts.end()) return it->second;
             return 0;
         }
+        
+        // find a session context connected to a given core ID
+        SessionContext *findClientByCoreID(uint32_t coreID)
+        {
+            for(auto &it: sessionContexts)
+                if(it.second->coreID==coreID)
+                    return it.second;
+            return 0;
+        }
 
         // shut down the client socket. disconnect will happen in select loop when read returns zero.
         void shutdownClient(SessionContext *sc)
@@ -677,7 +231,6 @@ class Graphserv
             sc->coreID= core->getID();
             return true;
         }
-
     private:
         int tcpPort, httpPort;
         string corePath;
@@ -703,7 +256,9 @@ class Graphserv
         uint32_t coreIDCounter;
         uint32_t sessionIDCounter;
 
+        // core ID => instance
         map<uint32_t,CoreInstance*> coreInstances;
+        // session ID => context
         map<uint32_t,SessionContext*> sessionContexts;
 
         set<uint32_t> clientsToRemove;
@@ -981,7 +536,7 @@ class Graphserv
             }
             else
             {
-                //flog(LOG_INFO, "new command: %s", line.c_str());
+                //~ flog(LOG_INFO, "new command: %s", line.c_str());
 //                CoreInstance *ci= findInstance(sc.coreID);
                 if(!fromServerQueue && (sc.lineQueue.size() || sc.isWaitingForCoreReply()))  //(ci && ci->hasDataForClient(sc.clientID))))
                 {
@@ -1118,6 +673,467 @@ class Graphserv
             }
         }
 
+        // called when a session socket is readable (level triggered)
+        template<ConnectionType CONNTYPE>
+        void cb_sessionReadable(evutil_socket_t fd, short what)
+        {
+            const size_t BUFSIZE= 128;
+            char buf[BUFSIZE];
+            SessionContext &sc= *libeventData.sessions[fd];
+            double time= getTime();
+            ssize_t sz= recv(fd, buf, sizeof(buf), 0);
+            auto closeSession= [this] (SessionContext& sc)
+            {
+                removeSession(sc.clientID);
+            };
+            if(sz==0)
+            {
+                flog(LOG_INFO, _("client %d: connection closed%s.\n"), sc.clientID, sc.shutdownTime? "": _(" by peer"));
+                closeSession(sc);
+            }
+            else if(sz<0)
+            {
+                flog(LOG_ERROR, _("recv() error, client %d, %d bytes in write buffer, %s\n"), sc.clientID, sc.getWritebufferSize(), strerror(errno));
+                closeSession(sc);
+            }
+            else
+            {
+                for(ssize_t i= 0; i<sz; i++)
+                {
+                    char c= buf[i];
+                    if(c=='\r') continue;   // someone is feeding us DOS newlines?
+                    sc.linebuf+= c;
+                    if(c=='\n')
+                    {
+                        //~ flog(LOG_INFO, "line from client: %s", sc.linebuf.c_str());
+
+                        linesFromClients++;
+
+                        if(CONNTYPE==CONN_HTTP)
+                            lineFromHTTPClient(sc.linebuf, *(HTTPSessionContext*)&sc, time);
+                        else
+                            lineFromClient(string(sc.linebuf), sc, time);
+                        sc.linebuf.clear();
+                    }
+                }
+            }
+        }
+
+        // called when a session socket is writable (edge triggered)
+        template<ConnectionType CONNTYPE>
+        void cb_sessionWritable(evutil_socket_t fd, short what)
+        {
+            flog(LOG_INFO, "session context writable event\n");
+            libeventData.sessions[fd]->flush();
+        }
+        
+        // called when a core pipe is readable (level triggered)
+        
+        // XXXXXXXXXX todo: handle different CB types (all callbacks)
+        void cb_coreReadable(evutil_socket_t fd, short what)
+        {
+            CoreInstance *ci= libeventData.cores[fd];
+            if(fd==ci->getReadFd())
+            {
+                const size_t BUFSIZE= 128;
+                char buf[BUFSIZE];
+                ssize_t sz= read(ci->getReadFd(), buf, sizeof(buf));
+                double time= getTime();
+                if(sz==0)
+                {
+                    flog(LOG_INFO, "core %s (ID %u, pid %d) has exited\n", ci->getName().c_str(), ci->getID(), (int)ci->getPid());
+                    int status;
+                    waitpid(ci->getPid(), &status, 0);  // un-zombify
+                    removeCoreInstance(ci);
+                }
+                else if(sz<0)
+                {
+                    flog(LOG_ERROR, "i/o error, core %s: %s\n", ci->getName().c_str(), strerror(errno));
+                    removeCoreInstance(ci);
+                }
+                else
+                {
+                    for(ssize_t i= 0; i<sz; i++)
+                    {
+                        char c= buf[i];
+                        if(c=='\r') continue;
+                        ci->linebuf+= c;
+                        if(c=='\n')
+                        {
+                            SessionContext *sc= findClient(ci->getLastClientID());
+                            bool clientWasWaiting= (sc && sc->isWaitingForCoreReply());
+                            ci->lineFromCore(ci->linebuf, *this);
+                            ci->linebuf.clear();
+                            // if this was the last line the client was waiting for, 
+                            // execute its queued commands now.
+                            if( clientWasWaiting )
+                                while(!sc->lineQueue.empty() && (!sc->isWaitingForCoreReply()))
+                                {
+                                    string& line= sc->lineQueue.front();
+                                    flog(LOG_INFO, "execing queued line from client: '%s", line.c_str());
+                                    lineFromClient(line, *sc, time, true);
+                                    sc->lineQueue.pop();
+                                }
+                        }
+                    }
+                }
+            }
+            else if(fd==ci->getStderrReadFd())
+            {
+                deque<string> lines= ci->stderrQ.nextLines(ci->getStderrReadFd());
+                for(deque<string>::const_iterator it= lines.begin(); it!=lines.end(); ++it)
+                    flog(LOG_INFO, "[%s] %s", ci->getName().c_str(), it->c_str());
+            }
+        }
+
+        // called when a core pipe is writable (edge triggered)
+        void cb_coreWritable(evutil_socket_t fd, short what)
+        {
+            //~ flog(LOG_INFO, "core writable event, ID %d, name %s. commandQ size: %d, flushable: %s, expectingReply: %s, expectingDataset: %s\n", 
+                //~ libeventData.cores[fd]->getID(), libeventData.cores[fd]->getName().c_str(),
+                //~ libeventData.cores[fd]->commandQ.size(), libeventData.cores[fd]->commandQ.front().flushable()? "true": "false",
+                //~ libeventData.cores[fd]->expectingReply? "true": "false", libeventData.cores[fd]->expectingDataset? "true": "false");
+            libeventData.cores[fd]->flushCommandQ(*this);
+            libeventData.cores[fd]->flush();
+            //~ flog(LOG_INFO, "after flushCommandQ: commandQ size: %d, flushable: %s, expectingReply: %s, expectingDataset: %s\n", 
+                //~ libeventData.cores[fd]->commandQ.size(), libeventData.cores[fd]->commandQ.front().flushable()? "true": "false",
+                //~ libeventData.cores[fd]->expectingReply? "true": "false", libeventData.cores[fd]->expectingDataset? "true": "false" );
+        }
+
+        // called when something connects to either of the listen sockets
+        template<ConnectionType CONNTYPE>
+        void cb_connect(evutil_socket_t fd, short what)
+        {
+            flog(LOG_INFO, "cb_connect(): fd=%d, what=%d\n", fd, what);
+            SessionContext *sc= acceptConnection(fd, CONNTYPE);
+            if(sc)
+            {
+                sc->sockfdRead= dup(sc->sockfd);
+                libeventData.sessions[sc->sockfd]= sc;
+                libeventData.sessions[sc->sockfdRead]= sc;
+                sc->readEvent= event_new(libeventData.base, sc->sockfdRead, EV_READ|EV_PERSIST, [](evutil_socket_t fd, short what, void *arg)
+                    {
+                        ((Graphserv*)arg)->cb_sessionReadable<CONNTYPE>(fd, what);
+                    }, this);
+                sc->writeEvent= event_new(libeventData.base, sc->sockfd, EV_WRITE|EV_PERSIST|EV_ET, [](evutil_socket_t fd, short what, void *arg)
+                    {
+                        ((Graphserv*)arg)->cb_sessionWritable<CONNTYPE>(fd, what);
+                    }, this);
+                event_add(sc->readEvent, nullptr);
+                event_add(sc->writeEvent, nullptr);
+            }
+            else
+            {
+                flog(LOG_ERROR, _("couldn't create connection.\n"));
+                //~ if(errno==EMFILE)
+                //~ {
+                    //~ double defer= 3.0;
+                    //~ flog(LOG_ERROR, _("too many open files. deferring new connections for %.0f seconds.\n"), defer);
+                    //~ deferNewConnectionsUntil= time + defer;
+                //~ }
+            }
+        }
+        
+        bool mainloop_libevent()
+        {
+#ifdef DEBUG_EVENTS
+            event_enable_debug_mode();
+#endif
+
+            flog(LOG_INFO, "compiled libevent version: %s\n", LIBEVENT_VERSION);
+            flog(LOG_INFO, "runtime libevent version: %s\n", event_get_version());
+            
+            event_config *cfg= event_config_new();
+            if(!cfg)
+                throw std::runtime_error("event_config_new() failed");
+            event_config_require_features(cfg, EV_FEATURE_ET);
+            if(!(libeventData.base= event_base_new_with_config(cfg)))
+                throw std::runtime_error("event_base_new_with_config() failed");
+            event_config_free(cfg);
+            
+            int i;
+            const char **methods = event_get_supported_methods();
+            flog(LOG_INFO, "Starting Libevent %s.  Available methods are:\n", event_get_version());
+            for (i=0; methods[i] != NULL; ++i)
+                flog(LOG_INFO, "    %s\n", methods[i]);
+            flog(LOG_INFO, "Using Libevent with backend method %s.\n", event_base_get_method(libeventData.base));
+            int f = event_base_get_features(libeventData.base);
+            if ((f & EV_FEATURE_ET))
+                flog(LOG_INFO, "  Edge-triggered events are supported.\n");
+            if ((f & EV_FEATURE_O1))
+                flog(LOG_INFO, "  O(1) event notification is supported.\n");
+            if ((f & EV_FEATURE_FDS))
+                flog(LOG_INFO, "  All FD types are supported.\n");
+            
+            event_callback_fn listen_cb= [] (evutil_socket_t fd, short what, void *arg)
+            {
+                Graphserv *self= (Graphserv*)arg;
+                self->cb_connect<CONN_TCP>(fd, what);
+            };
+            event_callback_fn http_cb= [] (evutil_socket_t fd, short what, void *arg)
+            {
+                Graphserv *self= (Graphserv*)arg;
+                self->cb_connect<CONN_HTTP>(fd, what);
+            };
+            event *ev= event_new(libeventData.base, listenSocket, EV_READ|EV_PERSIST, listen_cb, this);
+            event_add(ev, nullptr);
+            ev= event_new(libeventData.base, httpSocket, EV_READ|EV_PERSIST, http_cb, this);
+            event_add(ev, nullptr);
+            
+            while(!quit)
+            {
+                event_base_loop(libeventData.base, EVLOOP_ONCE);
+                // XXX todo: disconnect HTTP clients after first command. here or somewhere else?
+            }
+            
+            return true;
+        }
+
+        bool mainloop_select()
+        {
+            fd_set readfds, writefds;
+            int maxfd;
+            double deferNewConnectionsUntil= 0; // defer accept() calls. set if open files limit is hit.
+
+            flog(LOG_INFO, "entering main loop. TCP port: %d, HTTP port: %d\n", tcpPort, httpPort);
+            while(!quit)
+            {
+                double time= getTime();
+
+                FD_ZERO(&readfds);
+                FD_ZERO(&writefds);
+
+                maxfd= 0;
+
+                // when open files limit is hit, new connections will be deferred for a few seconds
+                if(deferNewConnectionsUntil < time)
+                {
+                    if(listenSocket) fd_add(readfds, listenSocket, maxfd);
+                    if(httpSocket) fd_add(readfds, httpSocket, maxfd);
+                }
+
+                // deferred removal of clients
+                for(set<uint32_t>::iterator i= clientsToRemove.begin(); i!=clientsToRemove.end(); ++i)
+                    removeSession(*i);
+                clientsToRemove.clear();
+
+                // init fd set for select: add client fds
+                for( map<uint32_t,SessionContext*>::iterator i= sessionContexts.begin(); i!=sessionContexts.end(); ++i )
+                {
+                    SessionContext *sc= i->second;
+                    double d= time-sc->stats.lastTime;
+                    if(d>10.0)
+                    {
+                        sc->stats.normalize(time);
+                        // flog(LOG_INFO, "client %u: bytesSent %.2f, linesQueued %.2f, coreCommandsSent %.2f, servCommandsSent %.2f\n",
+                        //      sc->clientID, sc->stats.bytesSent, sc->stats.linesQueued, sc->stats.coreCommandsSent, sc->stats.servCommandsSent);
+                        // testing this to prevent flooding.
+                        //~ if(sc->stats.linesQueued>5000) { flog(LOG_INFO, "choke\n"); sc->chokeTime= time+10.0; }
+                        sc->stats.reset();
+                        sc->stats.lastTime= time;
+                    }
+                    if(sc->chokeTime<time)  // chokeTime could be used to slow down a spamming client.
+                        fd_add(readfds, sc->sockfd, maxfd);
+                    else
+                        flog(LOG_INFO, "not reading from client %u (flood).\n", sc->clientID);
+                    // only add write fd if there is something to write
+                    if(!sc->writeBufferEmpty())
+                        fd_add(writefds, sc->sockfd, maxfd);
+                }
+
+                // init fd set for select: add core fds
+                for( map<uint32_t,CoreInstance*>::iterator i= coreInstances.begin(); i!=coreInstances.end(); ++i )
+                {
+                    CoreInstance *ci= i->second;
+                    fd_add(readfds, ci->getReadFd(), maxfd);
+                    fd_add(readfds, ci->getStderrReadFd(), maxfd);
+                    ci->flushCommandQ(*this);
+                    // only add write fd if there is something to write
+                    if(!ci->writeBufferEmpty())
+                        fd_add(writefds, ci->getWriteFd(), maxfd);
+                }
+
+                struct timeval timeout;
+                timeout.tv_sec= 2;
+                timeout.tv_usec= 0;
+                int r= select(maxfd+1, &readfds, &writefds, 0, &timeout);
+                if(r<0)
+                {
+                    switch(errno)
+                    {
+                        case EBADF:
+                            logerror("select()");
+                            // a file descriptor is bad, find out which and remove the client or core.
+                            for( map<uint32_t,SessionContext*>::iterator i= sessionContexts.begin(); i!=sessionContexts.end(); ++i )
+                                if( !i->second->writeBufferEmpty() && fcntl(i->second->sockfd, F_GETFL)==-1 )
+                                    flog(LOG_ERROR, _("bad fd, removing client %d.\n"), i->second->clientID),
+                                    forceClientDisconnect(i->second);
+                            for( map<uint32_t,CoreInstance*>::iterator i= coreInstances.begin(); i!=coreInstances.end(); ++i )
+                                if( fcntl(i->second->getReadFd(), F_GETFL)==-1 ||
+                                    (!i->second->writeBufferEmpty() && fcntl(i->second->getWriteFd(), F_GETFL)==-1) )
+                                    flog(LOG_ERROR, _("bad fd, removing core %d.\n"), i->second->getID()),
+                                    removeCoreInstance(i->second);
+                            continue;
+                        
+                        case EINTR:
+                            continue;
+
+                        default:
+                            logerror("select()");
+                            return false;
+                    }
+                }
+
+                time= getTime();
+
+                // check for incoming line-based or http connections.
+                struct { int socket; ConnectionType conntype; } socks[]= { { listenSocket, CONN_TCP }, { httpSocket, CONN_HTTP } };
+                for(auto& i: socks)
+                {
+                    if(i.socket && FD_ISSET(i.socket, &readfds))
+                        if(!acceptConnection(i.socket, i.conntype))
+                        {
+                            flog(LOG_ERROR, _("couldn't create connection.\n"));
+                            if(errno==EMFILE)
+                            {
+                                double defer= 3.0;
+                                flog(LOG_ERROR, _("too many open files. deferring new connections for %.0f seconds.\n"), defer);
+                                deferNewConnectionsUntil= time + defer;
+                            }
+                        }
+                }
+
+                // loop through all the session contexts, handle incoming data, flush outgoing data if possible.
+                for( map<uint32_t,SessionContext*>::iterator it= sessionContexts.begin(); it!=sessionContexts.end(); ++it )
+                {
+                    SessionContext &sc= *it->second;
+                    int sockfd= sc.sockfd;
+                    if(FD_ISSET(sockfd, &readfds))
+                    {
+                        const size_t BUFSIZE= 128;
+                        char buf[BUFSIZE];
+                        ssize_t sz= recv(sockfd, buf, sizeof(buf), 0);
+                        if(sz==0)
+                        {
+                            flog(LOG_INFO, _("client %d: connection closed%s.\n"), sc.clientID, sc.shutdownTime? "": _(" by peer"));
+                            clientsToRemove.insert(sc.clientID);
+                        }
+                        else if(sz<0)
+                        {
+                            flog(LOG_ERROR, _("recv() error, client %d, %d bytes in write buffer, %s\n"), sc.clientID, sc.getWritebufferSize(), strerror(errno));
+                            clientsToRemove.insert(sc.clientID);
+                        }
+                        else
+                        {
+                            for(ssize_t i= 0; i<sz; i++)
+                            {
+                                char c= buf[i];
+                                if(c=='\r') continue;   // someone is feeding us DOS newlines?
+                                sc.linebuf+= c;
+                                if(c=='\n')
+                                {
+                                    if(clientsToRemove.find(sc.clientID)!=clientsToRemove.end())
+                                        break;
+
+                                    linesFromClients++;
+
+									if(sc.connectionType==CONN_HTTP)
+                                        lineFromHTTPClient(sc.linebuf, *(HTTPSessionContext*)&sc, time);
+                                    else
+                                        lineFromClient(string(sc.linebuf), sc, time);
+                                    sc.linebuf.clear();
+                                }
+                            }
+                        }
+                    }
+                    if(FD_ISSET(sockfd, &writefds))
+                        sc.flush();
+                }
+
+                vector<CoreInstance*> coresToRemove;
+
+                // loop through all the core instances, handle incoming data, flush outgoing data if possible.
+                for( map<uint32_t,CoreInstance*>::iterator i= coreInstances.begin(); i!=coreInstances.end(); ++i )
+                {
+                    CoreInstance *ci= i->second;
+                    if(FD_ISSET(ci->getReadFd(), &readfds))
+                    {
+                        const size_t BUFSIZE= 1024;
+                        char buf[BUFSIZE];
+                        ssize_t sz= read(ci->getReadFd(), buf, sizeof(buf));
+                        if(sz==0)
+                        {
+                            flog(LOG_INFO, "core %s (ID %u, pid %d) has exited\n", ci->getName().c_str(), ci->getID(), (int)ci->getPid());
+                            int status;
+                            waitpid(ci->getPid(), &status, 0);  // un-zombify
+                            coresToRemove.push_back(ci);
+                        }
+                        else if(sz<0)
+                        {
+                            flog(LOG_ERROR, "i/o error, core %s: %s\n", ci->getName().c_str(), strerror(errno));
+                            coresToRemove.push_back(ci);
+                        }
+                        else
+                        {
+                            for(ssize_t i= 0; i<sz; i++)
+                            {
+                                char c= buf[i];
+                                if(c=='\r') continue;
+                                ci->linebuf+= c;
+                                if(c=='\n')
+                                {
+                                    SessionContext *sc= findClient(ci->getLastClientID());
+                                    bool clientWasWaiting= (sc && sc->isWaitingForCoreReply());
+                                    ci->lineFromCore(ci->linebuf, *this);
+                                    ci->linebuf.clear();
+                                    // if this was the last line the client was waiting for, 
+                                    // execute its queued commands now.
+                                    if( clientWasWaiting )
+                                        while(!sc->lineQueue.empty() && (!sc->isWaitingForCoreReply()))
+                                        {
+                                            string& line= sc->lineQueue.front();
+                                            flog(LOG_INFO, "execing queued line from client: '%s", line.c_str());
+                                            lineFromClient(line, *sc, time, true);
+                                            sc->lineQueue.pop();
+                                        }
+                                }
+                            }
+                        }
+                    }
+                    else if(FD_ISSET(ci->getStderrReadFd(), &readfds))
+                    {
+                        deque<string> lines= ci->stderrQ.nextLines(ci->getStderrReadFd());
+						for(deque<string>::const_iterator it= lines.begin(); it!=lines.end(); ++it)
+							flog(LOG_INFO, "[%s] %s", ci->getName().c_str(), it->c_str());
+					}
+                    
+					if(FD_ISSET(ci->getWriteFd(), &writefds))
+                        ci->flush();
+                }
+                // remove outside of loop to avoid invalidating iterators
+                for(size_t i= 0; i<coresToRemove.size(); i++)
+                    removeCoreInstance(coresToRemove[i]);
+
+                // go through any HTTP session contexts immediately after i/o.
+                for( map<uint32_t,SessionContext*>::iterator i= sessionContexts.begin(); i!=sessionContexts.end(); ++i )
+                {
+                    SessionContext *sc= i->second;
+                    CoreInstance *ci;
+                    // HTTP clients are disconnected once we don't have any more output for them.
+                    if( sc->connectionType==CONN_HTTP &&
+                        ((HTTPSessionContext*)sc)->conversationFinished &&
+                        sc->writeBufferEmpty() &&
+                        ((ci= findInstance(sc->coreID))==NULL || ci->hasDataForClient(sc->clientID)==false) )
+                    {
+                        if(!sc->shutdownTime)
+                            shutdownClient(sc);
+                    }
+                }
+            }
+
+            return true;
+        }
+        
         friend class ccInfo;
         friend class ccServerStats;
 };
