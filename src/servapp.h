@@ -741,9 +741,25 @@ class Graphserv
                 double time= getTime();
                 if(sz==0)
                 {
-                    flog(LOG_INFO, "core %s (ID %u, pid %d) has exited\n", ci->getName().c_str(), ci->getID(), (int)ci->getPid());
                     int status;
-                    waitpid(ci->getPid(), &status, 0);  // un-zombify
+                    waitpid(ci->getPid(), &status, 0);
+                    if(WIFEXITED(status))
+                    {
+                        flog(LOG_INFO, "core %s (ID %u, pid %d) exited with status %d\n", ci->getName().c_str(), ci->getID(), (int)ci->getPid(), WEXITSTATUS(status));
+                    }
+                    else if(WIFSIGNALED(status))
+                    {
+                        flog(LOG_INFO, "core %s (ID %u, pid %d) exited due to signal %d (%s)%s\n", ci->getName().c_str(), ci->getID(), (int)ci->getPid(), 
+                            WTERMSIG(status), strsignal(WTERMSIG(status)),
+                            #ifdef WCOREDUMP
+                            WCOREDUMP(status)? ", core dumped": ", core not dumped"
+                            #else
+                            ""
+                            #endif
+                            );
+                        
+                    }
+                    
                     removeCoreInstance(ci);
                 }
                 else if(sz<0)
