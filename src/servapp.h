@@ -157,6 +157,14 @@ class Graphserv
             if(it!=coreInstances.end()) coreInstances.erase(it);
             if(useLibevent)
             {
+                for(std::pair<uint32_t,SessionContext*> it: sessionContexts)
+                {
+                    if(it.second->coreID==core->getID())
+                    {
+                        flog(LOG_ERROR, _("removeCoreInstance(): removing client %d which is still connected to core '%s'\n"), it.second->clientID, core->getName().c_str());
+                        shutdownClient(it.second);
+                    }
+                }
                 event_free(core->readEvent);
                 event_free(core->stderrReadEvent);
                 event_free(core->writeEvent);
