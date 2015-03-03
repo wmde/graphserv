@@ -907,7 +907,22 @@ class Graphserv
             while(!quit)
             {
                 event_base_loop(libeventData.base, EVLOOP_ONCE);
-                // XXX todo: disconnect HTTP clients after first command. here or somewhere else?
+                // go through any HTTP session contexts immediately after i/o.
+                // XXX todo: doing this after write CB / in HTTPSessionContext::forwardDataset() etc. could be slightly more efficient
+                for( map<uint32_t,SessionContext*>::iterator i= sessionContexts.begin(); i!=sessionContexts.end(); ++i )
+                {
+                    SessionContext *sc= i->second;
+                    CoreInstance *ci;
+                    // HTTP clients are disconnected once we don't have any more output for them.
+                    if( sc->connectionType==CONN_HTTP &&
+                        ((HTTPSessionContext*)sc)->conversationFinished &&
+                        sc->writeBufferEmpty() &&
+                        ((ci= findInstance(sc->coreID))==NULL || ci->hasDataForClient(sc->clientID)==false) )
+                    {
+                        if(!sc->shutdownTime)
+                            shutdownClient(sc);
+                    }
+                }
             }
             
             return true;
