@@ -6,4 +6,4 @@ For some information on using Graphserv/Graphcore for Wikipedia Tools -- what's 
 
 GraphServ Documentation: `install.rst <https://github.com/jkroll20/graphserv/blob/master/doc/install.rst>`_, `usage.rst <https://github.com/jkroll20/graphserv/blob/master/doc/usage.rst>`_.
 
-
+Issue tracker: please file bugs and feature requests on [Phabricator](https://phabricator.wikimedia.org/maniphest/task/create/?projects=tcb-team,catgraph&title=%5BCatGraph%5D)
